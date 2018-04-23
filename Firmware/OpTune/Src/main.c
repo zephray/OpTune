@@ -51,9 +51,11 @@
 #include "stm32f3xx_hal.h"
 #include "fatfs.h"
 #include "lcd4004.h"
+#include "mcp4728.h"
+#include "mcp4012.h"
 
 /* USER CODE BEGIN Includes */
-
+#include "instruments.h"
 /* USER CODE END Includes */
 
 /* Private variables ---------------------------------------------------------*/
@@ -63,6 +65,7 @@ I2C_HandleTypeDef hi2c1;
 
 SPI_HandleTypeDef hspi1;
 
+TIM_HandleTypeDef htim4;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 
@@ -70,12 +73,45 @@ TIM_HandleTypeDef htim3;
 /* Private variables ---------------------------------------------------------*/
 FATFS SD_FatFs;  /* File system object for SD card logical drive */
 char SD_Path[4]; /* SD card logical drive path */
+
+#define BUFFER_SIZE 512
+#define SAMPLE_RATE 32000
+
+static unsigned short audio_buffer_1[BUFFER_SIZE];
+static unsigned short audio_buffer_2[BUFFER_SIZE];
+unsigned short * audio_buffer_playback = audio_buffer_1;
+unsigned short * audio_buffer_render = audio_buffer_2;
+unsigned int playback_pointer = 0;
+unsigned int render_pointer = 0;
+volatile unsigned char buffer_full_flag = 0;
+
+static unsigned char song_buffer[512]; // Hold 128 Instructions
+
+#define CH_NUM 32
+//#define LEVEL_MUL 2
+#define LEVEL_DIV 2
+
+typedef struct {
+  unsigned char onoff; 
+  unsigned short frequency; // Frequency in Hertz
+  unsigned char volume; // Initial Volume, max = 100%, min = 0%
+  unsigned char instrument;
+  unsigned char envelope; // Calculated current volume
+  unsigned long freq_counter; // Counter value
+  unsigned long freq_reverse; // At which value it should reverse the output 
+  unsigned long freq_reload;  // Initial value
+  unsigned long envelope_counter; // Volume envelope counter
+} sound_ch;
+
+sound_ch ch[CH_NUM];
+
+char message[30];
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
-static void MX_SPI1_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_DAC_Init(void);
 static void MX_TIM2_Init(void);
@@ -90,22 +126,27 @@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
 /* USER CODE END PFP */
 
 /* USER CODE BEGIN 0 */
+void delay_cycles(unsigned long delay) {
+  volatile unsigned long x = delay;
+  while (x--);
+}
+
 static int SDCard_Config(void)
 {
-  uint32_t counter = 0;
-  
   if(FATFS_LinkDriver(&USER_Driver, SD_Path) == 0)
   {
     /* Initialize the SD mounted on adafruit 1.8" TFT shield */
     if(BSP_SD_Init() != MSD_OK)
     {
       lcd_print("SD Init Failed. ");
+      return -1;
     }  
     
     /* Check the mounted device */
     if(f_mount(&SD_FatFs, (TCHAR const*)"/", 0) != FR_OK)
     {
       lcd_print("FS Mount Failed. ");
+      return -1;
     }  
     else
     {
@@ -121,6 +162,297 @@ static int SDCard_Config(void)
   
   return -1;
 }
+
+void playFrame(unsigned char *buf) {
+  lcd_send_cmd(0x8C, LCD_CHIP1); //Line 1
+  for (int i = 0; i < 16; i++)
+    lcd_send_dat(buf[i], LCD_CHIP1);
+  lcd_send_cmd(0xCC, LCD_CHIP1); //Line 2
+  for (int i = 16; i < 32; i++)
+    lcd_send_dat(buf[i], LCD_CHIP1);
+  lcd_send_cmd(0x40, LCD_CHIP1); //CGRAM
+  for (int i = 32; i < 96; i++)
+    lcd_send_dat(buf[i], LCD_CHIP1);
+  lcd_send_cmd(0x8C, LCD_CHIP2); //Line 1
+  for (int i = 96; i < 112; i++)
+    lcd_send_dat(buf[i], LCD_CHIP2);
+  lcd_send_cmd(0xCC, LCD_CHIP2); //Line 2
+  for (int i = 112; i < 128; i++)
+    lcd_send_dat(buf[i], LCD_CHIP2);
+  lcd_send_cmd(0x40, LCD_CHIP2); //CGRAM
+  for (int i = 128; i < 192; i++)
+    lcd_send_dat(buf[i], LCD_CHIP2);
+}
+
+void playMovie() {
+  FIL fil;        /* File object */
+  FRESULT fr;     /* FatFs return code */
+  static unsigned char buf[192*16]; // Hold 16 frame of image 
+  
+  fr = f_open(&fil, "out.bin", FA_READ);
+  if (fr) {
+    lcd_print("Unable to open file. ");
+  }
+    
+  lcd_send_cmd(0x01, LCD_BOTH);
+  HAL_Delay(5);
+  
+  unsigned int bytesRead = 1;
+  int startTick = HAL_GetTick();
+  int frameCount = 0;
+  // Frame length = 42 42 41 42 42 41...
+  while (bytesRead != 0) {
+    f_read(&fil, (void *)buf, 192*16, &bytesRead);
+    for (int i = 0; i < (bytesRead/192); i++) {
+      playFrame(buf+i*192);
+      frameCount ++;
+      while (HAL_GetTick() < ((frameCount/3)*125 + (frameCount%3)*42)); //24FPS
+    }
+  }
+}
+
+void play_wave() {
+  FIL fil;        /* File object */
+  FRESULT fr;     /* FatFs return code */
+
+  fr = f_open(&fil, "test.wav", FA_READ);
+  if (fr) {
+    lcd_print("Unable to open file. ");
+  }
+ 
+  unsigned int bytesRead = 1;
+  int playCount = 0;
+  while (bytesRead != 0) {
+    f_read(&fil, (void *)audio_buffer_render, BUFFER_SIZE * 2, &bytesRead);
+    for (int i = 0; i < BUFFER_SIZE; i++) audio_buffer_render[i] = audio_buffer_render[i] ^ 0x8000;
+    buffer_full_flag = 1;
+    playCount ++;
+    lcd_set_xy(0,1);
+    sprintf(message, "%d", playCount);
+    lcd_print(message);
+    while (buffer_full_flag);
+    unsigned short *buffer_temp;
+    buffer_temp = audio_buffer_playback;
+    audio_buffer_playback = audio_buffer_render;
+    audio_buffer_render = buffer_temp;
+    playback_pointer = 0;
+  }
+}
+
+
+void sound_set_pitch(int channel, unsigned long pitch) {
+  ch[channel].frequency = pitch;
+  ch[channel].freq_reload = SAMPLE_RATE / pitch;
+  ch[channel].freq_counter = ch[channel].freq_reload;
+  ch[channel].freq_reverse = ch[channel].freq_reload / 2;
+  ch[channel].freq_reverse = ch[channel].freq_reload * instruments[ch[channel].instrument].duty / 256;
+  ch[channel].envelope_counter = 0;
+  lcd_set_xy(0, 1);
+  sprintf(message, "P %d, %d", channel, pitch);
+  lcd_print("            ");
+  lcd_set_xy(0, 1);
+  lcd_print(message);
+}
+
+void sound_set_instrument(int channel, unsigned char instrument) {
+  ch[channel].envelope_counter = 0;
+  ch[channel].instrument = instrument;
+  lcd_set_xy(0, 1);
+  sprintf(message, "I %d, %d", channel, instrument);
+  lcd_print("            ");
+  lcd_set_xy(0, 1);
+  lcd_print(message);
+}
+
+void sound_set_volume(int channel, unsigned char volume) {
+  /*ch[channel].volume = volume;*/
+}
+
+void sound_set_onoff(int channel, unsigned char onoff) {
+  ch[channel].onoff = onoff;
+}
+
+void render_song() {
+  unsigned long cs; //current sample
+  
+  // process envelope
+  unsigned char a_length;
+  unsigned char a_step;
+  unsigned char d_length;
+  unsigned char d_step;
+  unsigned char s_length;
+  unsigned char r_length;
+  unsigned char r_step;
+  
+  for (int c = 0; c < CH_NUM; c++) {
+    a_length = instruments[ch[c].instrument].a_length;
+    a_step = ch[c].volume / a_step;
+    d_length = instruments[ch[c].instrument].d_length;
+    d_step = instruments[ch[c].instrument].d_step;
+    s_length = instruments[ch[c].instrument].s_length;
+    r_length = instruments[ch[c].instrument].r_length;
+    r_step = (ch[c].volume - d_length * d_step) / r_length;
+    
+    if ((ch[c].envelope_counter) < (a_length - 1)) {
+      ch[c].envelope += a_step;
+    }
+    else if ((ch[c].envelope_counter) == (a_length - 1)) {
+      ch[c].envelope = ch[c].volume;
+    }
+    else if ((ch[c].envelope_counter) < (a_length + d_length)) {
+      ch[c].envelope -= d_step;
+    }
+    else if ((ch[c].envelope_counter) < (a_length + d_length + s_length + r_length - 1)) {
+      ch[c].envelope -= r_step;
+    }
+    else if ((ch[c].envelope_counter) == (a_length + d_length + s_length + r_length - 1)) {
+      ch[c].envelope = 0;
+    }
+    
+    ch[c].envelope_counter ++;
+  }
+  
+  for (int s = 0; s < BUFFER_SIZE; s ++) {
+    cs = 0;
+    for (int c = 0; c < CH_NUM; c++) {
+      if (ch[c].onoff == 0) continue;
+      if (ch[c].freq_counter == 0) {
+        ch[c].freq_counter = ch[c].freq_reload;
+      }
+      else if (ch[c].freq_counter >= ch[c].freq_reverse) {
+        cs += ch[c].envelope;
+        //cs += 255;
+      }
+      else {
+        // do nothing
+      }
+      ch[c].freq_counter --;
+    }
+#ifdef LEVEL_MUL
+    cs = cs * LEVEL_MUL;
+#else
+    cs = cs / LEVEL_DIV;
+#endif
+    
+    audio_buffer_render[s] = cs;
+  }
+}
+
+// SNG Format
+// Each operation is four bytes, one byte instruction, one byte channel, 2 bytes parameters
+// Operation List
+// 0x00 NOP
+// 0x01 DELAY MS
+// 0x02 SET PAN
+// 0x03 SET VOL 
+// 0x04 SET PIT
+// 0x05 SET INSTRUMENT
+// 0x06 SET CH ON/OFF 0x0001 on/ 0x0000 off
+// 0x07 MOD INSTRUMENT DUTY RESERVED
+// 0x08 MOD INSTRUMENT ATTACK DECAY
+// 0x09 MOD INSTRUMENT SUSTAIN RELEASE
+
+void play_song() {
+  FIL fil;        /* File object */
+  FRESULT fr;     /* FatFs return code */
+
+  fr = f_open(&fil, "test.sng", FA_READ);
+  if (fr) {
+    lcd_print("Unable to open file. ");
+  }
+ 
+  unsigned int bytesRead = 1;
+  unsigned long delayStart;
+  unsigned short *buffer_temp;
+
+  for (int i = 0; i < CH_NUM; i++) {
+    sound_set_instrument(i, 0);
+    sound_set_onoff(i, 0);
+    sound_set_volume(i, 255);
+  }
+  
+  /*sound_set_pitch(0, 1000);
+  sound_set_onoff(0, 1);
+  
+  sound_set_pitch(1, 2000);
+  sound_set_onoff(1, 1);*/
+  
+  buffer_full_flag = 0;
+  int playCount = 0;
+  
+  /*while (1) {
+    render_song();
+    buffer_full_flag = 1;
+    while (buffer_full_flag);
+    unsigned short *buffer_temp;
+    buffer_temp = audio_buffer_playback;
+    audio_buffer_playback = audio_buffer_render;
+    audio_buffer_render = buffer_temp;
+    playback_pointer = 0;
+  }*/
+  
+  while (bytesRead != 0) {
+    f_read(&fil, (void *)song_buffer, 512, &bytesRead);
+    for (int i = 0; i < (bytesRead / 4); i++) {
+      unsigned char op = song_buffer[i * 4 + 0];
+      unsigned char c =  song_buffer[i * 4 + 1];
+      unsigned short par = (((unsigned short)song_buffer[i * 4 + 2]) << 8) | 
+        ((unsigned short)song_buffer[i * 4 + 3]);
+      if (op != 0x01) {
+        switch (op) {
+          //case 0x03: sound_set_volume(c, par); break;
+          case 0x04: sound_set_pitch(c, par); sound_set_onoff(c, 1); break;
+          case 0x05: sound_set_instrument(c, par); break;
+          case 0x06: sound_set_onoff(c, par); break;
+        }
+      }
+      else {
+        delayStart = HAL_GetTick();
+        //lcd_set_xy(0, 1);
+        //sprintf(message, "D %d", par);
+        //lcd_print("            ");
+        //lcd_set_xy(0, 1);
+        //lcd_print(message);
+        while ((HAL_GetTick() - delayStart) < par) {
+          if (buffer_full_flag != 1) {
+            buffer_temp = audio_buffer_playback;
+            audio_buffer_playback = audio_buffer_render;
+            audio_buffer_render = buffer_temp;
+            playback_pointer = 0;
+            render_song();
+            buffer_full_flag = 1;
+          }
+        }
+      }
+    }
+  }
+}
+
+void init_timer4() {
+  __HAL_RCC_TIM4_CLK_ENABLE();
+  htim4.Instance = TIM4;
+  htim4.Init.Prescaler = 100;
+  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim4.Init.Period = 20;
+  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim4.Init.RepetitionCounter = 0;
+  HAL_TIM_Base_Init(&htim4);
+  HAL_TIM_Base_Start_IT(&htim4);
+  HAL_NVIC_SetPriority(TIM4_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(TIM4_IRQn);
+}
+
+void TIM4_IRQHandler()
+{
+    HAL_TIM_IRQHandler(&htim4);
+    HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, audio_buffer_playback[playback_pointer]);
+    if (playback_pointer < BUFFER_SIZE - 1) {
+      playback_pointer ++;
+    } else {
+      playback_pointer = 0;
+      buffer_full_flag = 0;
+    }
+}
 /* USER CODE END 0 */
 
 /**
@@ -128,15 +460,13 @@ static int SDCard_Config(void)
   *
   * @retval None
   */
+
 int main(void)
 {
   /* USER CODE BEGIN 1 */
   int sd_ready;
-  FIL fil;        /* File object */
-  char line[100]; /* Line buffer */
-  FRESULT fr;     /* FatFs return code */
   /* USER CODE END 1 */
-
+  
   /* MCU Configuration----------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
@@ -163,20 +493,23 @@ int main(void)
   //MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
   lcd_init();
+  dac_init(&hi2c1);
+  dpot_init();
+  
   sd_ready = SDCard_Config();
   
-  if (sd_ready == 0) {
-    /* Open a text file */
-    fr = f_open(&fil, "test.txt", FA_READ);
-    if (fr) {
-      lcd_print("Unable to open file. ");
-    }
-
-    /* Read all lines and display it */
-    while (f_gets(line, sizeof line, &fil)) {
-        lcd_print(line);
-    }
+  if (sd_ready != 0) {
+    while(1);
   }
+  
+  dpot_set(1, 20);
+  HAL_DAC_Start(&hdac, DAC_CHANNEL_1);
+  init_timer4();
+  //play_wave();
+  play_song();
+  HAL_DAC_Stop(&hdac, DAC_CHANNEL_1);
+  
+  //playMovie();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -266,7 +599,7 @@ static void MX_DAC_Init(void)
 
     /**DAC channel OUT1 config 
     */
-  sConfig.DAC_Trigger = DAC_TRIGGER_SOFTWARE;
+  sConfig.DAC_Trigger = DAC_TRIGGER_NONE;
   sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_ENABLE;
   if (HAL_DAC_ConfigChannel(&hdac, &sConfig, DAC_CHANNEL_1) != HAL_OK)
   {
@@ -275,10 +608,10 @@ static void MX_DAC_Init(void)
 
     /**Configure Noise wave generation on DAC OUT1 
     */
-  if (HAL_DACEx_NoiseWaveGenerate(&hdac, DAC_CHANNEL_1, DAC_LFSRUNMASK_BIT0) != HAL_OK)
+  /*if (HAL_DACEx_NoiseWaveGenerate(&hdac, DAC_CHANNEL_1, DAC_LFSRUNMASK_BIT0) != HAL_OK)
   {
     _Error_Handler(__FILE__, __LINE__);
-  }
+  }*/
 
 }
 
@@ -310,32 +643,6 @@ static void MX_I2C1_Init(void)
     /**Configure Digital filter 
     */
   if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
-  {
-    _Error_Handler(__FILE__, __LINE__);
-  }
-
-}
-
-/* SPI1 init function */
-static void MX_SPI1_Init(void)
-{
-
-  /* SPI1 parameter configuration*/
-  hspi1.Instance = SPI1;
-  hspi1.Init.Mode = SPI_MODE_MASTER;
-  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
-  hspi1.Init.DataSize = SPI_DATASIZE_4BIT;
-  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_4;
-  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
-  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-  hspi1.Init.CRCPolynomial = 7;
-  hspi1.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
-  hspi1.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
-  if (HAL_SPI_Init(&hspi1) != HAL_OK)
   {
     _Error_Handler(__FILE__, __LINE__);
   }

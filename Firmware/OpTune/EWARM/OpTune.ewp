@@ -1041,6 +1041,12 @@
                 <name>$PROJ_DIR$\..\Src\main.c</name>
             </file>
             <file>
+                <name>$PROJ_DIR$\..\Src\mcp4012.c</name>
+            </file>
+            <file>
+                <name>$PROJ_DIR$\..\Src\mcp4728.c</name>
+            </file>
+            <file>
                 <name>$PROJ_DIR$\..\Src\sd_spi.c</name>
             </file>
             <file>

@@ -18,11 +18,6 @@
 
 #define WR_DELAY 200
 
-void delay_cycles(size_t delay) {
-  volatile size_t x = delay;
-  while (x--);
-}
-
 void lcd_send_byte(unsigned char byte, LCD_TARGET target) {
   /*LCD_D7_OUT((byte >> 3)&0x01);
   LCD_D6_OUT((byte >> 2)&0x01);
@@ -68,6 +63,11 @@ void lcd_init() {
   lcd_send_cmd(0x01, LCD_BOTH);
   lcd_send_cmd(0x06, LCD_BOTH);
   lcd_send_cmd(0x80, LCD_BOTH);
+}
+
+void lcd_set_xy(int x, int y) {
+  unsigned char target = (y * 40 + x) | 0x80;
+  lcd_send_cmd(target, LCD_CHIP1);
 }
 
 void lcd_print(char *str) {
